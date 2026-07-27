@@ -6,16 +6,30 @@
   1. 水果基本資料包含水果種類與品種。
   2. 商品檔定義產地、等級、大小、銷售單位與包裝，不保存售價。
   3. 每日正式售價保存於 product_price_daily，AI/規則建議保存於 price_recommendation。
-  4. inventory_ledger 以「門市 + 商品 + 批號」保存唯一庫存餘額，商品總庫存由 View 加總。
+  4. stock_ledger 以「門市 + 商品 + 批號」保存唯一庫存餘額，商品總庫存由 View 加總。
   5. 銷售不因庫存不足而失敗；FIFO 正常批號不足時，差額記入系統 NEGATIVE 批號。
   6. sales_posting 唯一對應 sales_detail，控制未過帳、過帳中、完成與失敗，避免重複沖庫存。
+  水果與商品主檔
+供應商與進貨
+每日定價與AI建議
+每月批號庫存帳
+庫存異動明細
+POS銷售與付款
+銷售過帳與FIFO
+庫存調整
+保存期限規則
+
+未來可擴充功能
+現金結算
+組合商品／水果禮盒
+
 */
 
 CREATE DATABASE IF NOT EXISTS ifruit_sales_db
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_0900_ai_ci;
 
-USE fruit_sales_db;
+USE ifruit_sales_db;
 
 SET NAMES utf8mb4;
 SET time_zone = '+08:00';
@@ -57,6 +71,28 @@ CREATE TABLE system_user (
     CONSTRAINT fk_system_user_store FOREIGN KEY (store_id) REFERENCES store (store_id) ON UPDATE RESTRICT ON DELETE SET NULL,
     CONSTRAINT ck_system_user_active CHECK (is_active IN (0, 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='系統使用者與權限角色基本資料';
+
+CREATE TABLE member_master (
+    member_id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '會員主鍵識別碼',
+    member_no            VARCHAR(30) NOT NULL COMMENT '會員編號，供POS查詢及銷售單關聯使用',
+    member_name          VARCHAR(100) NOT NULL COMMENT '會員姓名',
+    phone                VARCHAR(30) NULL COMMENT '會員聯絡電話',
+    email                VARCHAR(255) NULL COMMENT '會員電子郵件',
+    birth_date           DATE NULL COMMENT '會員生日',
+    address              VARCHAR(255) NULL COMMENT '會員聯絡地址',
+    registered_store_id  BIGINT UNSIGNED NULL COMMENT '會員首次註冊門市；無指定門市時可為NULL',
+    member_status        VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' COMMENT '會員狀態，ACTIVE為有效、INACTIVE為停用',
+    remarks              VARCHAR(500) NULL COMMENT '會員備註',
+    created_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
+    updated_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
+    PRIMARY KEY (member_id),
+    UNIQUE KEY uk_member_no (member_no),
+    KEY idx_member_phone (phone),
+    KEY idx_member_email (email),
+    KEY idx_member_registered_store (registered_store_id),
+    CONSTRAINT fk_member_registered_store FOREIGN KEY (registered_store_id) REFERENCES store (store_id) ON UPDATE RESTRICT ON DELETE SET NULL,
+    CONSTRAINT ck_member_status CHECK (member_status IN ('ACTIVE', 'INACTIVE'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='會員基本資料';
 
 /* =========================================================
    02. 基礎主檔
@@ -120,7 +156,7 @@ CREATE TABLE fruit_base (
     variety_name        VARCHAR(100) NOT NULL DEFAULT '' COMMENT '水果品種名稱，例如富士、愛文；無品種時留空字串',
     display_name        VARCHAR(200) NOT NULL COMMENT '水果顯示名稱，例如富士蘋果或愛文芒果',
     english_name        VARCHAR(150) NULL COMMENT '水果英文名稱',
-    inventory_unit_id   BIGINT UNSIGNED NOT NULL COMMENT '此水果主要庫存管理單位，例如公斤或顆',
+    stock_unit_id       BIGINT UNSIGNED NOT NULL COMMENT '此水果主要庫存管理單位，例如公斤或顆',
     storage_method      VARCHAR(30) NOT NULL DEFAULT 'ROOM_TEMPERATURE' COMMENT '預設保存方式，例如ROOM_TEMPERATURE、REFRIGERATED或FROZEN',
     description         TEXT NULL COMMENT '水果特性、保存注意事項或其他說明',
     is_active           TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否啟用，1為啟用，0為停用',
@@ -129,8 +165,8 @@ CREATE TABLE fruit_base (
     PRIMARY KEY (fruit_id),
     UNIQUE KEY uk_fruit_code (fruit_code),
     UNIQUE KEY uk_fruit_type_variety (fruit_type_name, variety_name),
-    KEY idx_fruit_inventory_unit (inventory_unit_id),
-    CONSTRAINT fk_fruit_inventory_unit FOREIGN KEY (inventory_unit_id) REFERENCES unit (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    KEY idx_fruit_stock_unit (stock_unit_id),
+    CONSTRAINT fk_fruit_stock_unit FOREIGN KEY (stock_unit_id) REFERENCES unit (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_fruit_storage CHECK (storage_method IN ('ROOM_TEMPERATURE', 'REFRIGERATED', 'FROZEN', 'CONTROLLED')),
     CONSTRAINT ck_fruit_active CHECK (is_active IN (0, 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='水果基本資料，直接包含水果種類與品種';
@@ -179,36 +215,34 @@ CREATE TABLE product (
     grade_id                       BIGINT UNSIGNED NULL COMMENT '商品等級，可為NULL表示不區分等級',
     size_id                        BIGINT UNSIGNED NULL COMMENT '商品大小規格，可為NULL表示不區分大小',
     sale_unit_id                   BIGINT UNSIGNED NOT NULL COMMENT 'POS銷售單位，例如公斤、顆、盒或袋',
-    inventory_unit_id              BIGINT UNSIGNED NOT NULL COMMENT '過帳時實際扣除庫存所使用的單位',
+    stock_unit_id                  BIGINT UNSIGNED NOT NULL COMMENT '過帳時實際扣除庫存所使用的單位',
     sale_mode                      VARCHAR(20) NOT NULL COMMENT '銷售計量方式，BY_WEIGHT、BY_COUNT或BY_PACKAGE',
     package_spec                   VARCHAR(100) NOT NULL DEFAULT '' COMMENT '包裝規格，例如散裝、6入盒、3公斤箱',
-    conversion_mode               VARCHAR(20) NOT NULL DEFAULT 'FIXED' COMMENT '銷售單位轉庫存單位方式，FIXED為固定換算，ACTUAL為銷售時輸入實際重量或數量',
-    inventory_qty_per_sale_unit    DECIMAL(18,6) NULL COMMENT '每銷售一個銷售單位，預估應扣除的庫存重量（公斤）；例如按公斤銷售填1，按顆銷售可填0.30，按盒銷售可填1.50',
+    conversion_mode                VARCHAR(20) NOT NULL DEFAULT 'FIXED' COMMENT '銷售單位轉庫存單位方式,目前固定為FIXED，FIXED為固定換算，ACTUAL為銷售時輸入實際重量或數量',
+    stock_qty_per_sale_unit        DECIMAL(18,6) NULL COMMENT '每銷售一個銷售單位，預估應扣除的庫存重量（公斤）；例如按公斤銷售填1，按顆銷售可填0.30，按盒銷售可填1.50',
     track_shelf_life               TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否需要依批號追蹤保存期限與到期日',
     is_active                      TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否啟用，1為啟用，0為停用',
     grade_key                      BIGINT UNSIGNED GENERATED ALWAYS AS (IFNULL(grade_id, 0)) STORED COMMENT '供商品規格唯一鍵使用的等級正規化值',
     size_key                       BIGINT UNSIGNED GENERATED ALWAYS AS (IFNULL(size_id, 0)) STORED COMMENT '供商品規格唯一鍵使用的大小正規化值',
-    conversion_key                 DECIMAL(18,6) GENERATED ALWAYS AS (IFNULL(inventory_qty_per_sale_unit, 0)) STORED COMMENT '供商品規格唯一鍵使用的換算數量正規化值',
     created_at                     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
     updated_at                     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
     PRIMARY KEY (product_id),
     UNIQUE KEY uk_product_code (product_code),
-    UNIQUE KEY uk_product_business (fruit_id, origin_id, grade_key, size_key, sale_unit_id, package_spec, conversion_key),
+    UNIQUE KEY uk_product_business (fruit_id, origin_id, grade_id, size_id, sale_unit_id, package_spec),
     KEY idx_product_origin (origin_id),
     KEY idx_product_grade (grade_id),
     KEY idx_product_size (size_id),
     KEY idx_product_sale_unit (sale_unit_id),
-    KEY idx_product_inventory_unit (inventory_unit_id),
-    CONSTRAINT fk_product_fruit FOREIGN KEY (fruit_id) REFERENCES fruit_master (fruit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    KEY idx_product_stock_unit (stock_unit_id),
+    CONSTRAINT fk_product_fruit FOREIGN KEY (fruit_id) REFERENCES fruit_base (fruit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_product_origin FOREIGN KEY (origin_id) REFERENCES origin (origin_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_product_grade FOREIGN KEY (grade_id) REFERENCES fruit_grade (grade_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_product_size FOREIGN KEY (size_id) REFERENCES fruit_size (size_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT fk_product_sale_unit FOREIGN KEY (sale_unit_id) REFERENCES unit_master (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT fk_product_inventory_unit FOREIGN KEY (inventory_unit_id) REFERENCES unit_master (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_product_sale_unit FOREIGN KEY (sale_unit_id) REFERENCES unit (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_product_stock_unit FOREIGN KEY (stock_unit_id) REFERENCES unit (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_product_sale_mode CHECK (sale_mode IN ('BY_WEIGHT', 'BY_COUNT', 'BY_PACKAGE')),
     CONSTRAINT ck_product_conversion_mode CHECK (conversion_mode IN ('FIXED', 'ACTUAL')),
-    CONSTRAINT ck_product_conversion_qty CHECK ((conversion_mode = 'ACTUAL') OR (inventory_qty_per_sale_unit IS NOT NULL AND inventory_qty_per_sale_unit > 0)),
-    CONSTRAINT ck_product_negative CHECK (allow_negative_inventory IN (0, 1)),
+    CONSTRAINT ck_product_conversion_qty CHECK ((conversion_mode = 'ACTUAL') OR (stock_qty_per_sale_unit IS NOT NULL AND stock_qty_per_sale_unit > 0)),
     CONSTRAINT ck_product_shelf_life CHECK (track_shelf_life IN (0, 1)),
     CONSTRAINT ck_product_active CHECK (is_active IN (0, 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='可販售商品主檔，不保存售價，負責區分產地、等級、大小、單位與包裝';
@@ -250,11 +284,12 @@ CREATE TABLE shelf_life_rule (
     created_at                  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
     updated_at                  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
     PRIMARY KEY (shelf_life_rule_id),
-    KEY idx_shelf_life_lookup (product_id, store_id, effective_from, effective_to, is_active),
+    KEY idx_shelf_life_lookup (store_id,product_id, effective_from, effective_to, is_active),
     CONSTRAINT fk_shelf_life_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_shelf_life_store FOREIGN KEY (store_id) REFERENCES store (store_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_shelf_life_dates CHECK (effective_to IS NULL OR effective_to >= effective_from),
-    CONSTRAINT ck_shelf_life_active CHECK (is_active IN (0, 1))
+    CONSTRAINT ck_shelf_life_active CHECK (is_active IN (0, 1)),
+    CONSTRAINT ck_storage_method CHECK (storage_method IN ('ROOM_TEMPERATURE','REFRIGERATED','FROZEN','CONTROLLED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='依商品、門市與保存方式定義預估保存期限及警示規則';
 
 /* =========================================================
@@ -286,7 +321,7 @@ CREATE TABLE pricing_policy (
     UNIQUE KEY uk_pricing_policy_code (policy_code),
     KEY idx_pricing_policy_lookup (store_id, fruit_id, product_id, effective_from, effective_to, is_active),
     CONSTRAINT fk_pricing_policy_store FOREIGN KEY (store_id) REFERENCES store (store_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT fk_pricing_policy_fruit FOREIGN KEY (fruit_id) REFERENCES fruit_master (fruit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_pricing_policy_fruit FOREIGN KEY (fruit_id) REFERENCES fruit_base (fruit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_pricing_policy_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_pricing_target_margin CHECK (target_margin_rate > -1 AND target_margin_rate < 1),
     CONSTRAINT ck_pricing_min_margin CHECK (minimum_margin_rate > -1 AND minimum_margin_rate < 1),
@@ -391,7 +426,7 @@ CREATE TABLE product_price_daily (
    06. 採購入庫
    ========================================================= */
 
-CREATE TABLE purchase_receipt_master (
+CREATE TABLE purchase_receipt (
     purchase_receipt_id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '進貨驗收單主鍵識別碼',
     store_id                  BIGINT UNSIGNED NOT NULL COMMENT '本批貨入庫門市',
     supplier_id               BIGINT UNSIGNED NOT NULL COMMENT '本批貨供應商',
@@ -424,11 +459,11 @@ CREATE TABLE purchase_receipt_item (
     lot_no                     VARCHAR(80) NOT NULL COMMENT '進貨批號；供應商無批號時由系統依日期與流水號產生',
     purchase_qty               DECIMAL(18,3) NOT NULL COMMENT '供應商單據上的進貨數量',
     purchase_unit_id           BIGINT UNSIGNED NOT NULL COMMENT '供應商單據上的進貨單位',
-    inventory_qty              DECIMAL(18,3) NOT NULL COMMENT '換算為商品庫存單位後的入庫數量',
+    stock_qty                  DECIMAL(18,3) NOT NULL COMMENT '換算為商品庫存單位後的入庫數量',
     purchase_unit_cost         DECIMAL(18,4) NOT NULL COMMENT '每一供應商進貨單位的未稅或約定進價',
     additional_cost            DECIMAL(18,4) NOT NULL DEFAULT 0 COMMENT '此明細分攤的運費、包材、人工或其他附加成本',
     line_total_cost            DECIMAL(18,4) GENERATED ALWAYS AS ((purchase_qty * purchase_unit_cost) + additional_cost) STORED COMMENT '此明細總成本，由進貨數量乘進價再加附加成本產生',
-    inventory_unit_cost        DECIMAL(18,4) NULL COMMENT '換算至每一庫存單位的實際成本，可於過帳時計算並保存',
+    stock_unit_cost            DECIMAL(18,4) NULL COMMENT '換算至每一庫存單位的實際成本，可於過帳時計算並保存',
     actual_origin_id           BIGINT UNSIGNED NULL COMMENT '本批實際產地；可用來核對商品主檔標示產地',
     harvest_date               DATE NULL COMMENT '採收日期，供應商未提供時可為NULL',
     packing_date               DATE NULL COMMENT '包裝日期，散裝或未知時可為NULL',
@@ -444,15 +479,87 @@ CREATE TABLE purchase_receipt_item (
     UNIQUE KEY uk_purchase_receipt_item (purchase_receipt_id, item_no),
     KEY idx_purchase_receipt_item_product (product_id, lot_no),
     KEY idx_purchase_detail_origin (actual_origin_id),
-    CONSTRAINT fk_purchase_detail_header FOREIGN KEY (purchase_receipt_id) REFERENCES purchase_receipt_header (purchase_receipt_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+    CONSTRAINT fk_purchase_detail_header FOREIGN KEY (purchase_receipt_id) REFERENCES purchase_receipt (purchase_receipt_id) ON UPDATE RESTRICT ON DELETE CASCADE,
     CONSTRAINT fk_purchase_detail_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT fk_purchase_detail_unit FOREIGN KEY (purchase_unit_id) REFERENCES unit_master (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_detail_unit FOREIGN KEY (purchase_unit_id) REFERENCES unit (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_purchase_detail_origin FOREIGN KEY (actual_origin_id) REFERENCES origin (origin_id) ON UPDATE RESTRICT ON DELETE SET NULL,
-    CONSTRAINT ck_purchase_detail_qty CHECK (purchase_qty > 0 AND inventory_qty > 0),
+    CONSTRAINT ck_purchase_detail_qty CHECK (purchase_qty > 0 AND stock_qty > 0),
     CONSTRAINT fk_purchase_detail_user FOREIGN KEY (created_by) REFERENCES system_user (user_id) ON UPDATE RESTRICT ON DELETE SET NULL,
     CONSTRAINT ck_purchase_detail_cost CHECK (purchase_unit_cost >= 0 AND additional_cost >= 0),
     CONSTRAINT ck_purchase_detail_dates CHECK (expiry_date IS NULL OR harvest_date IS NULL OR expiry_date >= harvest_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='水果進貨驗收明細，包含商品、批號、數量、成本及效期';
+
+/* =========================================================
+   06A. 採購退回
+   ========================================================= */
+
+CREATE TABLE purchase_return (
+    purchase_return_id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '採購退回單主鍵識別碼',
+    store_id                    BIGINT UNSIGNED NOT NULL COMMENT '採購退回所屬門市',
+    supplier_id                 BIGINT UNSIGNED NOT NULL COMMENT '退回商品的供應商',
+    original_purchase_receipt_id BIGINT UNSIGNED NOT NULL COMMENT '本退回單所對應的原始進貨驗收單',
+    return_no                   VARCHAR(50) NOT NULL COMMENT '採購退回單號',
+    return_date                 DATE NOT NULL COMMENT '採購退回日期',
+    return_status               VARCHAR(20) NOT NULL DEFAULT 'DRAFT' COMMENT '退回單狀態，DRAFT、CONFIRMED、POSTED或CANCELLED',
+    currency_code               CHAR(3) NOT NULL DEFAULT 'TWD' COMMENT '退回交易幣別，使用ISO 4217三碼，例如TWD',
+    total_amount                DECIMAL(18,2) NOT NULL DEFAULT 0 COMMENT '採購退回總金額',
+    reason                      VARCHAR(1000) NULL COMMENT '採購退回原因，例如品質不良、數量短少或規格不符',
+    created_by                  BIGINT UNSIGNED NULL COMMENT '建立採購退回單的使用者',
+    approved_by                 BIGINT UNSIGNED NULL COMMENT '核准採購退回單的使用者',
+    approved_at                 DATETIME(3) NULL COMMENT '採購退回單核准時間',
+    posted_at                   DATETIME(3) NULL COMMENT '完成庫存扣帳時間',
+    created_at                  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
+    updated_at                  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
+    PRIMARY KEY (purchase_return_id),
+    UNIQUE KEY uk_purchase_return_no (store_id, return_no),
+    UNIQUE KEY uk_purchase_return_parent (purchase_return_id, original_purchase_receipt_id),
+    KEY idx_purchase_return_date (store_id, return_date, return_status),
+    KEY idx_purchase_return_supplier (supplier_id, return_date),
+    KEY idx_purchase_return_original_receipt (original_purchase_receipt_id),
+    CONSTRAINT fk_purchase_return_store FOREIGN KEY (store_id) REFERENCES store (store_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_return_supplier FOREIGN KEY (supplier_id) REFERENCES supplier (supplier_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_return_original_receipt FOREIGN KEY (original_purchase_receipt_id) REFERENCES purchase_receipt (purchase_receipt_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_return_creator FOREIGN KEY (created_by) REFERENCES system_user (user_id) ON UPDATE RESTRICT ON DELETE SET NULL,
+    CONSTRAINT fk_purchase_return_approver FOREIGN KEY (approved_by) REFERENCES system_user (user_id) ON UPDATE RESTRICT ON DELETE SET NULL,
+    CONSTRAINT ck_purchase_return_status CHECK (return_status IN ('DRAFT', 'CONFIRMED', 'POSTED', 'CANCELLED')),
+    CONSTRAINT ck_purchase_return_amount CHECK (total_amount >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='採購退回主檔，每張退回單對應一張原始進貨驗收單';
+
+CREATE TABLE purchase_return_item (
+    purchase_return_item_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '採購退回明細主鍵識別碼',
+    purchase_return_id           BIGINT UNSIGNED NOT NULL COMMENT '所屬採購退回單主鍵',
+    item_no                      SMALLINT UNSIGNED NOT NULL COMMENT '採購退回單行號',
+    original_purchase_receipt_id BIGINT UNSIGNED NOT NULL COMMENT '本退回明細所對應的原始進貨驗收單',
+    original_purchase_receipt_item_id BIGINT UNSIGNED NOT NULL COMMENT '本退回明細所對應的原始進貨驗收明細',
+    product_id                   BIGINT UNSIGNED NOT NULL COMMENT '退回商品',
+    stock_lot_id                 BIGINT UNSIGNED NULL COMMENT '實際扣除的目前月份批號庫存帳；尚未過帳時可為NULL',
+    return_qty                   DECIMAL(18,3) NOT NULL COMMENT '依退回單位記錄的退回數量',
+    return_unit_id               BIGINT UNSIGNED NOT NULL COMMENT '採購退回單位',
+    stock_qty                    DECIMAL(18,3) NOT NULL COMMENT '換算為商品庫存單位後的退回數量',
+    return_unit_cost             DECIMAL(18,4) NOT NULL COMMENT '本次退回採用的每一退回單位成本',
+    line_total_amount            DECIMAL(18,4) GENERATED ALWAYS AS (return_qty * return_unit_cost) STORED COMMENT '本筆採購退回金額',
+    reason_code                  VARCHAR(30) NOT NULL DEFAULT 'OTHER' COMMENT '退回原因代碼，例如QUALITY、SHORTAGE、SPEC_MISMATCH、DAMAGE或OTHER',
+    remarks                      VARCHAR(500) NULL COMMENT '採購退回明細備註',
+    item_status                  VARCHAR(20) NOT NULL DEFAULT 'PENDING' COMMENT '庫存過帳狀態，PENDING、PROCESSING、POSTED、FAILED或CANCELLED',
+    posted_at                    DATETIME(3) NULL COMMENT '完成庫存扣帳時間',
+    error_message                TEXT NULL COMMENT '庫存扣帳失敗原因',
+    created_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
+    updated_at                   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
+    PRIMARY KEY (purchase_return_item_id),
+    UNIQUE KEY uk_purchase_return_item_line (purchase_return_id, item_no),
+    KEY idx_purchase_return_item_original (original_purchase_receipt_id, original_purchase_receipt_item_id),
+    KEY idx_purchase_return_item_product (product_id),
+    KEY idx_purchase_return_item_lot (stock_lot_id),
+    CONSTRAINT fk_purchase_return_item_header FOREIGN KEY (purchase_return_id, original_purchase_receipt_id) REFERENCES purchase_return (purchase_return_id, original_purchase_receipt_id) ON UPDATE RESTRICT ON DELETE CASCADE,
+    CONSTRAINT fk_purchase_return_item_original FOREIGN KEY (original_purchase_receipt_id, original_purchase_receipt_item_id) REFERENCES purchase_receipt_item (purchase_receipt_id, purchase_receipt_item_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_return_item_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_return_item_unit FOREIGN KEY (return_unit_id) REFERENCES unit (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_return_item_lot FOREIGN KEY (stock_lot_id) REFERENCES stock_lot (stock_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT ck_purchase_return_item_qty CHECK (return_qty > 0 AND stock_qty > 0),
+    CONSTRAINT ck_purchase_return_item_cost CHECK (return_unit_cost >= 0),
+    CONSTRAINT ck_purchase_return_item_reason CHECK (reason_code IN ('QUALITY', 'SHORTAGE', 'SPEC_MISMATCH', 'DAMAGE', 'OTHER')),
+    CONSTRAINT ck_purchase_return_item_status CHECK (item_status IN ('PENDING', 'PROCESSING', 'POSTED', 'FAILED', 'CANCELLED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='採購退回明細，逐筆對應原始進貨驗收明細並扣除批號庫存';
 
 /* =========================================================
    07. 商品批號庫存帳：唯一庫存餘額來源
@@ -466,36 +573,37 @@ CREATE TABLE stock_lot (
     lot_no                    VARCHAR(80) NOT NULL COMMENT '庫存批號；負庫存使用系統固定批號NEGATIVE',
     lot_type                  VARCHAR(20) NOT NULL DEFAULT 'NORMAL' COMMENT '批號類型，NORMAL為正常進貨批號、NEGATIVE為系統負庫存批號、ADJUSTMENT為調整批號',
     supplier_id               BIGINT UNSIGNED NULL COMMENT '正常批號的供應商；系統負庫存批號可為NULL',
-    first_receipt_detail_id   BIGINT UNSIGNED NULL COMMENT '首次建立此批號的進貨驗收明細',
+    first_receipt_item_id     BIGINT UNSIGNED NULL COMMENT '首次建立此批號的進貨驗收明細',
     received_date             DATE NOT NULL COMMENT '批號首次入庫日期；FIFO依此日期排序',
     harvest_date              DATE NULL COMMENT '本批採收日期',
     expiry_date               DATE NULL COMMENT '本批實際或預估到期日',
     warning_date              DATE NULL COMMENT '本批開始顯示即期警示的日期',
     begin_in_qty              DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '月初此批號累計入庫及回補數量',
     begin_out_qty             DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '月初此批號累計銷售、耗損及其他出庫數量',
-    begin_balance_qty         DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '月初此批號目前庫存餘額；NEGATIVE批號可為負值',
+    in_qty                    DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '本月此批號新增入庫及回補數量',
+    out_qty                   DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '本月此批號新增銷售、耗損及其他出庫數量',
     end_in_qty                DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '月底此批號累計入庫及回補數量',
-    end_out_qty             DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '月底此批號累計銷售、耗損及其他出庫數量',
+    end_out_qty               DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '月底此批號累計銷售、耗損及其他出庫數量',
     end_balance_qty           DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '月底此批號目前庫存餘額；NEGATIVE批號可為負值',
-    inventory_unit_cost       DECIMAL(18,4) NULL COMMENT '每一庫存單位成本；負庫存尚未回補時可為NULL',
-    balance_value             DECIMAL(18,4) GENERATED ALWAYS AS (balance_qty * IFNULL(inventory_unit_cost, 0)) STORED COMMENT '目前批號庫存帳面價值',
-    lot_status                VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' COMMENT '批號狀態，ACTIVE、DEPLETED、EXPIRED或CLOSED',
+    stock_unit_cost           DECIMAL(18,4) NULL COMMENT '每一庫存單位成本；負庫存尚未回補時可為NULL',
+    balance_value             DECIMAL(18,4) GENERATED ALWAYS AS (end_balance_qty * IFNULL(stock_unit_cost, 0)) STORED COMMENT '目前批號庫存帳面價值',
+    lot_status                VARCHAR(20) NOT NULL DEFAULT 'ACTIVE' COMMENT '批號狀態，ACTIVE、CLOSED',
     version_no                BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '樂觀鎖版本號，每次更新庫存時遞增',
     created_at                DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
     updated_at                DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
     PRIMARY KEY (stock_lot_id),
-    UNIQUE KEY uk_stock_lot (stock_ym,store_id, product_id, lot_no),
-    KEY idx_stock_lot_fifo (store_id, product_id, lot_type, lot_status, received_date, inventory_ledger_id),
+    UNIQUE KEY uk_stock_lot (store_id, stock_ym,product_id, lot_no),
+    KEY idx_stock_lot_fifo (store_id, product_id, lot_type, lot_status, received_date, stock_lot_id),
     KEY idx_stock_lot_expiry (store_id, expiry_date, lot_status),
     KEY idx_stock_lot_supplier (supplier_id),
+    KEY idx_stock_lot_store_id_ym (stock_ym,store_id),
     CONSTRAINT fk_stock_lot_store FOREIGN KEY (store_id) REFERENCES store (store_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_stock_lot_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT fk_inventory_supplier FOREIGN KEY (supplier_id) REFERENCES supplier (supplier_id) ON UPDATE RESTRICT ON DELETE SET NULL,
-    CONSTRAINT fk_inventory_first_receipt FOREIGN KEY (first_receipt_detail_id) REFERENCES purchase_receipt_detail (purchase_receipt_detail_id) ON UPDATE RESTRICT ON DELETE SET NULL,
-    CONSTRAINT ck_inventory_lot_type CHECK (lot_type IN ('NORMAL', 'NEGATIVE', 'ADJUSTMENT')),
-    CONSTRAINT ck_inventory_lot_status CHECK (lot_status IN ('ACTIVE', 'DEPLETED', 'EXPIRED', 'CLOSED')),
-    CONSTRAINT ck_inventory_sign CHECK ((lot_type = 'NEGATIVE' AND balance_qty <= 0) OR (lot_type <> 'NEGATIVE' AND balance_qty >= 0)),
-    CONSTRAINT ck_inventory_totals CHECK (total_in_qty >= 0 AND total_out_qty >= 0)
+    CONSTRAINT fk_stock_lot_supplier FOREIGN KEY (supplier_id) REFERENCES supplier (supplier_id) ON UPDATE RESTRICT ON DELETE SET NULL,
+    CONSTRAINT fk_stock_lot_first_receipt FOREIGN KEY (first_receipt_item_id) REFERENCES purchase_receipt_item (purchase_receipt_item_id) ON UPDATE RESTRICT ON DELETE SET NULL,
+    CONSTRAINT ck_stock_lot_type CHECK (lot_type IN ('NORMAL', 'NEGATIVE', 'ADJUSTMENT')),
+    CONSTRAINT ck_stock_lot_status CHECK (lot_status IN ('ACTIVE', 'CLOSED')),
+    CONSTRAINT ck_stock_lot_sign CHECK ((lot_type = 'NEGATIVE' AND end_balance_qty <= 0) OR (lot_type <> 'NEGATIVE' AND end_balance_qty >= 0))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='商品批號庫存帳，商品總庫存由本表批號餘額加總，不另存重複總庫存表';
 
 CREATE TABLE stock_lot_detail (
@@ -504,7 +612,7 @@ CREATE TABLE stock_lot_detail (
     item_no                   VARCHAR(20) NOT NULL COMMENT '項次編號，通常為進貨驗收單或銷售單的項次',
     store_id                  BIGINT UNSIGNED NOT NULL COMMENT '庫存異動所屬門市',
     product_id                BIGINT UNSIGNED NOT NULL COMMENT '庫存異動所屬商品',
-    transaction_type          VARCHAR(30) NOT NULL COMMENT '異動類型，例如PURCHASE、SALE、RETURN、WASTE、ADJUSTMENT或NEGATIVE_SETTLEMENT',
+    transaction_type          VARCHAR(30) NOT NULL COMMENT '異動類型，例如PURCHASE、SALE、RETURN、WASTE、ADJUSTMENT或NEGATIVE_CLEAR',
     quantity_change           DECIMAL(18,3) NOT NULL COMMENT '庫存異動數量，入庫為正數，出庫為負數',
     unit_cost                 DECIMAL(18,4) NULL COMMENT '異動當時每一庫存單位成本，未知時可為NULL',
     cost_amount               DECIMAL(18,4) GENERATED ALWAYS AS (quantity_change * IFNULL(unit_cost, 0)) STORED COMMENT '本筆庫存異動成本金額，出庫通常為負值',
@@ -526,18 +634,19 @@ CREATE TABLE stock_lot_detail (
     CONSTRAINT fk_stock_lot_detail_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_stock_lot_detail_lot FOREIGN KEY (stock_lot_id) REFERENCES stock_lot (stock_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_stock_lot_detail_user FOREIGN KEY (created_by) REFERENCES system_user (user_id) ON UPDATE RESTRICT ON DELETE SET NULL,
-    CONSTRAINT ck_stock_lot_detail_type CHECK (transaction_type IN ('PURCHASE', 'SALE', 'SALE_RETURN', 'SUPPLIER_RETURN', 'WASTE', 'DAMAGE', 'SAMPLE', 'STOCKTAKE', 'ADJUSTMENT', 'NEGATIVE_SETTLEMENT')),
+    CONSTRAINT ck_stock_lot_detail_type CHECK (transaction_type IN ('PURCHASE', 'SALE', 'SALE_RETURN', 'SUPPLIER_RETURN', 'WASTE', 'DAMAGE', 'SAMPLE', 'STOCKTAKE', 'ADJUSTMENT', 'NEGATIVE_CLEAR')),
     CONSTRAINT ck_stock_lot_detail_balance CHECK (after_balance_qty = before_balance_qty + quantity_change)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='不可任意覆寫的庫存異動歷史，供查帳、成本及盤差追蹤';
 
-
---進貨過帳，控制進貨驗收單與庫存的過帳 目前整合至 purchase_receipt_item 表
+-- @SCHEMA_REVIEW_IGNORE_BEGIN
+-- 原因：目前整合至 purchase_receipt_item 表
+--進貨過帳，控制進貨驗收單與庫存的過帳 
 CREATE TABLE purchase_posting (
     purchase_posting_id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '進貨過帳控制主鍵識別碼',
-    purchase_receipt_master_id BIGINT UNSIGNED NOT NULL COMMENT '待過帳或已過帳的進貨驗收明細',
+    purchase_receipt_item_id BIGINT UNSIGNED NOT NULL COMMENT '待過帳或已過帳的進貨驗收明細',
     stock_lot_id       BIGINT UNSIGNED NULL COMMENT '過帳後增加的商品批號庫存帳',
     posting_status            VARCHAR(20) NOT NULL DEFAULT 'PENDING' COMMENT '過帳狀態，PENDING、PROCESSING、POSTED、FAILED或CANCELLED',
-    posted_inventory_qty      DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '已成功過帳的庫存單位數量',
+    posted_stock_qty          DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '已成功過帳的庫存單位數量',
     retry_count               SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '失敗後重新執行過帳的次數',
     started_at                DATETIME(3) NULL COMMENT '本次過帳開始時間',
     posted_at                 DATETIME(3) NULL COMMENT '過帳成功時間',
@@ -549,10 +658,10 @@ CREATE TABLE purchase_posting (
     UNIQUE KEY uk_purchase_posting_master (purchase_receipt_master_id),
     KEY idx_purchase_posting_status (posting_status, created_at),
     KEY idx_purchase_posting_ledger (stock_lot_id),
-    CONSTRAINT fk_purchase_posting_master FOREIGN KEY (purchase_receipt_master_id) REFERENCES purchase_receipt_master (purchase_receipt_master_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_purchase_posting_master FOREIGN KEY (purchase_receipt_item_id) REFERENCES purchase_receipt_master (purchase_receipt_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_purchase_posting_ledger FOREIGN KEY (stock_lot_id) REFERENCES stock_lot (stock_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_purchase_posting_status CHECK (posting_status IN ('PENDING', 'PROCESSING', 'POSTED', 'FAILED', 'CANCELLED')),
-    CONSTRAINT ck_purchase_posting_qty CHECK (posted_inventory_qty >= 0)
+    CONSTRAINT ck_purchase_posting_qty CHECK (posted_stock_qty >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='進貨明細過帳控制，避免同一進貨重複增加庫存';
 
 /* =========================================================
@@ -570,6 +679,7 @@ CREATE TABLE sales_master (
     subtotal_amount           DECIMAL(18,2) NOT NULL DEFAULT 0 COMMENT '折扣前商品小計',
     discount_amount           DECIMAL(18,2) NOT NULL DEFAULT 0 COMMENT '整張銷售單折扣金額',
     total_amount              DECIMAL(18,2) NOT NULL DEFAULT 0 COMMENT '顧客實際應付或退回總金額',
+    member_id                 BIGINT UNSIGNED NULL COMMENT '本次交易會員；非會員銷售可為NULL',
     remarks                   VARCHAR(500) NULL COMMENT '銷售、退貨或作廢備註',
     cashier_user_id           BIGINT UNSIGNED NULL COMMENT '執行結帳的收銀人員',
     created_at                DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
@@ -582,18 +692,21 @@ CREATE TABLE sales_master (
     CONSTRAINT fk_sales_master_cashier FOREIGN KEY (cashier_user_id) REFERENCES system_user (user_id) ON UPDATE RESTRICT ON DELETE SET NULL,
     CONSTRAINT ck_sales_type CHECK (sale_type IN ('SALE', 'RETURN', 'VOID')),
     CONSTRAINT ck_sales_status CHECK (sales_status IN ('OPEN', 'COMPLETED', 'VOIDED', 'REFUNDED')),
-    CONSTRAINT ck_sales_amount CHECK (subtotal_amount >= 0 AND discount_amount >= 0)
+    CONSTRAINT ck_sales_amount CHECK (subtotal_amount >= 0 AND discount_amount >= 0),
+    CONSTRAINT fk_sales_master_member FOREIGN KEY (member_id) REFERENCES member_master (member_id) ON UPDATE RESTRICT ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='POS銷售、退貨及作廢主檔';
 
 CREATE TABLE sales_detail (
     sales_detail_id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '銷售明細主鍵識別碼',
     sales_master_id           BIGINT UNSIGNED NOT NULL COMMENT '所屬銷售單主鍵',
     item_no                   SMALLINT UNSIGNED NOT NULL COMMENT '銷售單行號',
+    original_sales_master_id  BIGINT UNSIGNED NULL COMMENT '退貨關聯的原始銷售主檔主鍵識別碼',
+    original_sales_detail_id  BIGINT UNSIGNED NULL COMMENT '退貨關聯的原始銷售明細主鍵識別碼',
     product_id                BIGINT UNSIGNED NOT NULL COMMENT '銷售商品',
     product_price_daily_id    BIGINT UNSIGNED NULL COMMENT '結帳時採用的每日正式售價資料；臨時手動價格可為NULL',
     sale_qty                  DECIMAL(18,3) NOT NULL COMMENT '依銷售單位計算的銷售數量，例如2公斤、3顆或1盒',
     sale_unit_id              BIGINT UNSIGNED NOT NULL COMMENT '本筆交易實際銷售單位',
-    inventory_qty             DECIMAL(18,3) NOT NULL COMMENT '過帳時應扣除的庫存單位數量，由固定換算或電子秤實際重量取得',
+    stock_qty                 DECIMAL(18,3) NOT NULL COMMENT '過帳時應扣除的庫存單位數量，由固定換算或電子秤實際重量取得',
     unit_price                DECIMAL(18,2) NOT NULL COMMENT '本筆交易成交單價，必須保存當時價格快照',
     discount_amount           DECIMAL(18,2) NOT NULL DEFAULT 0 COMMENT '本明細折扣金額',
     amount                    DECIMAL(18,2) GENERATED ALWAYS AS ((sale_qty * unit_price) - discount_amount) STORED COMMENT '本明細成交金額',
@@ -607,8 +720,9 @@ CREATE TABLE sales_detail (
     CONSTRAINT fk_sales_detail_header FOREIGN KEY (sales_master_id) REFERENCES sales_master (sales_master_id) ON UPDATE RESTRICT ON DELETE CASCADE,
     CONSTRAINT fk_sales_detail_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_sales_detail_price FOREIGN KEY (product_price_daily_id) REFERENCES product_price_daily (product_price_daily_id) ON UPDATE RESTRICT ON DELETE SET NULL,
-    CONSTRAINT fk_sales_detail_unit FOREIGN KEY (sale_unit_id) REFERENCES unit_master (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT ck_sales_detail_qty CHECK (sale_qty > 0 AND inventory_qty > 0),
+    CONSTRAINT fk_sales_detail_unit FOREIGN KEY (sale_unit_id) REFERENCES unit (unit_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_sales_detail_original FOREIGN KEY (original_sales_master_id, original_sales_detail_id) REFERENCES sales_detail (sales_master_id, sales_detail_id) ON UPDATE RESTRICT ON DELETE SET NULL,
+    CONSTRAINT ck_sales_detail_qty CHECK (sale_qty > 0 AND stock_qty > 0),
     CONSTRAINT ck_sales_detail_price CHECK (unit_price >= 0 AND discount_amount >= 0),
     CONSTRAINT ck_sales_detail_amount CHECK ((sale_qty * unit_price) >= discount_amount)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='POS銷售商品明細，保存成交價與應扣庫存數量';
@@ -638,10 +752,10 @@ CREATE TABLE sales_posting (
     sales_detail_id           BIGINT UNSIGNED NOT NULL COMMENT '唯一對應一筆銷售明細，防止重複過帳',
     posting_batch_no          VARCHAR(50) NULL COMMENT '每日或批次過帳工作編號，方便查詢整批執行結果',
     posting_status            VARCHAR(20) NOT NULL DEFAULT 'PENDING' COMMENT '過帳狀態，PENDING、PROCESSING、POSTED、FAILED或CANCELLED',
-    expected_inventory_qty    DECIMAL(18,3) NOT NULL COMMENT '依銷售明細預計沖銷的庫存數量',
-    posted_inventory_qty      DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '已完成沖銷的庫存數量',
-    has_negative_inventory    TINYINT(1) NOT NULL DEFAULT 0 COMMENT '本筆過帳是否使用系統負庫存批號',
-    negative_inventory_qty    DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '正常批號不足而轉入NEGATIVE批號的數量',
+    expected_stock_qty        DECIMAL(18,3) NOT NULL COMMENT '依銷售明細預計沖銷的庫存數量',
+    posted_stock_qty          DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '已完成沖銷的庫存數量',
+    has_negative_stock        TINYINT(1) NOT NULL DEFAULT 0 COMMENT '本筆過帳是否使用系統負庫存批號',
+    negative_stock_qty        DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '正常批號不足而轉入NEGATIVE批號的數量',
     cost_status               VARCHAR(20) NOT NULL DEFAULT 'PENDING' COMMENT '銷售成本狀態，PENDING、FINAL或ADJUSTED',
     posted_cost               DECIMAL(18,4) NOT NULL DEFAULT 0 COMMENT '依FIFO批號成本計算的已過帳銷售成本',
     retry_count               SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '失敗後重新過帳次數',
@@ -658,8 +772,8 @@ CREATE TABLE sales_posting (
     CONSTRAINT fk_sales_posting_detail FOREIGN KEY (sales_detail_id) REFERENCES sales_detail (sales_detail_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_sales_posting_status CHECK (posting_status IN ('PENDING', 'PROCESSING', 'POSTED', 'FAILED', 'CANCELLED')),
     CONSTRAINT ck_sales_posting_cost_status CHECK (cost_status IN ('PENDING', 'FINAL', 'ADJUSTED')),
-    CONSTRAINT ck_sales_posting_negative CHECK (has_negative_inventory IN (0, 1) AND negative_inventory_qty >= 0),
-    CONSTRAINT ck_sales_posting_qty CHECK (expected_inventory_qty > 0 AND posted_inventory_qty >= 0),
+    CONSTRAINT ck_sales_posting_negative CHECK (has_negative_stock IN (0, 1) AND negative_stock_qty >= 0),
+    CONSTRAINT ck_sales_posting_qty CHECK (expected_stock_qty > 0 AND posted_stock_qty >= 0),
     CONSTRAINT ck_sales_posting_cost CHECK (posted_cost >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='銷售明細過帳控制，判斷未過帳、處理中、完成或失敗並防止重複過帳';
 
@@ -667,7 +781,7 @@ CREATE TABLE sales_posting_lot (
     sales_posting_lot_id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '銷售批號沖銷明細主鍵識別碼',
     sales_posting_id            BIGINT UNSIGNED NOT NULL COMMENT '所屬銷售過帳控制資料',
     allocation_seq              SMALLINT UNSIGNED NOT NULL COMMENT '同一銷售明細依FIFO跨批號沖銷的順序',
-    sales_master_id             BIGINT UNSIGNED NOT NULL COMMENT '實際被沖銷的商品批號庫存帳',
+    stock_lot_id                BIGINT UNSIGNED NOT NULL COMMENT '實際被沖銷的商品批號庫存帳',
     lot_no                      VARCHAR(80) NOT NULL COMMENT '過帳當時批號快照，避免日後查帳依賴主檔顯示',
     allocation_type             VARCHAR(20) NOT NULL COMMENT '沖銷類型，FIFO_NORMAL為正常FIFO批號、NEGATIVE為負庫存、RETURN為退貨回補',
     allocated_qty               DECIMAL(18,3) NOT NULL COMMENT '分攤至此批號的庫存數量，保存為正數',
@@ -678,29 +792,31 @@ CREATE TABLE sales_posting_lot (
     updated_at                  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
     PRIMARY KEY (sales_posting_lot_id),
     UNIQUE KEY uk_sales_lot_seq (sales_posting_id, allocation_seq),
-    KEY idx_sales_lot_sales (sales_master_id),
+    KEY idx_sales_lot_sales (stock_lot_id),
     CONSTRAINT fk_sales_lot_posting FOREIGN KEY (sales_posting_id) REFERENCES sales_posting (sales_posting_id) ON UPDATE RESTRICT ON DELETE CASCADE,
-    CONSTRAINT fk_sales_lot_sales FOREIGN KEY (sales_master_id) REFERENCES sales_master (sales_master_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_sales_lot_sales FOREIGN KEY (stock_lot_id) REFERENCES stock_lot (stock_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_sales_lot_type CHECK (allocation_type IN ('FIFO_NORMAL', 'NEGATIVE', 'RETURN')),
     CONSTRAINT ck_sales_allocation_qty CHECK (allocated_qty > 0),
     CONSTRAINT ck_sales_allocation_cost_status CHECK (cost_status IN ('PENDING', 'FINAL', 'ADJUSTED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='記錄每筆銷售依FIFO實際扣除哪些批號，以及不足時轉入負庫存的數量';
 
--- 定時任務將負庫存成本回填至原負庫存銷售,  目前應該不用，期未再將負庫存調整為0庫存
+-- @SCHEMA_REVIEW_IGNORE_BEGIN
+-- 原因：目前應該不用，期未再將負庫存調整為0庫存
+-- 定時任務將負庫存成本回填至原負庫存銷售,  
 CREATE TABLE negative_stock_settlement (
     negative_stock_settlement_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '負庫存成本回補主鍵識別碼',
     sales_posting_lot_id             BIGINT UNSIGNED NOT NULL COMMENT '原先使用NEGATIVE批號且成本待定的銷售沖銷明細',
-    receipt_stock_lot_master_id      BIGINT UNSIGNED NOT NULL COMMENT '後續進貨用來補回負庫存及確認成本的正常批號庫存帳',
+    receipt_stock_lot_id             BIGINT UNSIGNED NOT NULL COMMENT '後續進貨用來補回負庫存及確認成本的正常批號庫存帳',
     settled_qty                      DECIMAL(18,3) NOT NULL COMMENT '本次由後續進貨回補的負庫存數量',
     settlement_unit_cost             DECIMAL(18,4) NOT NULL COMMENT '後續進貨正常批號的實際庫存單位成本',
     settlement_cost                  DECIMAL(18,4) GENERATED ALWAYS AS (settled_qty * settlement_unit_cost) STORED COMMENT '本次回補後應補列的銷售成本',
     settled_at                       DATETIME(3) NOT NULL COMMENT '負庫存回補與成本確認時間',
     created_at                       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
-    PRIMARY KEY (negative_inventory_settlement_id),
-    KEY idx_negative_settlement_allocation (sales_posting_allocation_id),
-    KEY idx_negative_settlement_receipt_lot (receipt_stock_lot_master_id),
-    CONSTRAINT fk_negative_settlement_allocation FOREIGN KEY (sales_posting_allocation_id) REFERENCES sales_posting_allocation (sales_posting_allocation_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT fk_negative_settlement_ledger FOREIGN KEY (receipt_stock_lot_master_id) REFERENCES stock_lot_master (stock_lot_master_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    PRIMARY KEY (negative_stock_settlement_id),
+    KEY idx_negative_settlement_allocation (sales_posting_lot_id),
+    KEY idx_negative_settlement_receipt_lot (receipt_stock_lot_id),
+    CONSTRAINT fk_negative_settlement_allocation FOREIGN KEY (sales_posting_lot_id) REFERENCES sales_posting_lot (sales_posting_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_negative_settlement_ledger FOREIGN KEY (receipt_stock_lot_id) REFERENCES stock_lot (stock_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT ck_negative_settlement_qty CHECK (settled_qty > 0),
     CONSTRAINT ck_negative_settlement_cost CHECK (settlement_unit_cost >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='後續進貨先沖負庫存時，將實際成本回填至原負庫存銷售';
@@ -711,11 +827,13 @@ CREATE TABLE negative_stock_settlement (
 
 CREATE TABLE stock_adj (
     stock_adj_id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '庫存調整單主鍵識別碼',
+    stock_ym                  VARCHAR(6) NOT NULL COMMENT '庫存調整所屬年月，格式YYYYMM',
     store_id                  BIGINT UNSIGNED NOT NULL COMMENT '庫存調整所屬門市',
     stock_adj_no              VARCHAR(20) NOT NULL COMMENT '庫存調整單號',
     stock_adj_date            DATE NOT NULL COMMENT '庫存調整所屬營業日期',
-    stock_adj_type            VARCHAR(30) NOT NULL COMMENT '調整類型，STOCKTAKE、WASTE、DAMAGE、SAMPLE、CORRECTION或OTHER',
+    stock_adj_type            VARCHAR(30) NOT NULL COMMENT '調整類型，STOCKTAKE、WASTE、DAMAGE、SAMPLE、CORRECTION或OTHER,NEGATIVE_CLEAR',
     stock_adj_status          VARCHAR(20) NOT NULL DEFAULT 'DRAFT' COMMENT '調整單狀態，DRAFT、APPROVED、POSTED或CANCELLED',
+    from_store_id             BIGINT UNSIGNED NULL COMMENT '調出門市；一般庫存調整為NULL，門市調撥時必填',
     reason                    VARCHAR(1000) NULL COMMENT '盤差、腐壞、碰傷、試吃或其他調整原因',
     created_by                BIGINT UNSIGNED NULL COMMENT '建立庫存調整單的使用者',
     approved_by               BIGINT UNSIGNED NULL COMMENT '核准庫存調整單的使用者',
@@ -724,36 +842,40 @@ CREATE TABLE stock_adj (
     created_at                DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
     updated_at                DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
     PRIMARY KEY (stock_adj_id),
-    UNIQUE KEY uk_stock_adj_no (store_id, adjustment_no),
-    KEY idx_stock_adj_date (store_id, adjustment_date, adjustment_status),
+    UNIQUE KEY uk_stock_adj_no (stock_ym,store_id, stock_adj_no),
+    KEY idx_stock_adj_date (stock_ym, store_id, stock_adj_date, stock_adj_status),
     CONSTRAINT fk_stock_adj_store FOREIGN KEY (store_id) REFERENCES store (store_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
     CONSTRAINT fk_stock_adj_creator FOREIGN KEY (created_by) REFERENCES system_user (user_id) ON UPDATE RESTRICT ON DELETE SET NULL,
     CONSTRAINT fk_stock_adj_approver FOREIGN KEY (approved_by) REFERENCES system_user (user_id) ON UPDATE RESTRICT ON DELETE SET NULL,
-    CONSTRAINT ck_adjustment_type CHECK (adjustment_type IN ('STOCKTAKE', 'WASTE', 'DAMAGE', 'SAMPLE', 'CORRECTION', 'OTHER')),
-    CONSTRAINT ck_adjustment_status CHECK (adjustment_status IN ('DRAFT', 'APPROVED', 'POSTED', 'CANCELLED'))
+    CONSTRAINT ck_stock_adj_type CHECK (stock_adj_type IN ('STOCKTAKE', 'WASTE', 'DAMAGE', 'SAMPLE', 'CORRECTION', 'OTHER','NEGATIVE_CLEAR')),
+    CONSTRAINT ck_stock_adj_status CHECK (stock_adj_status IN ('DRAFT', 'APPROVED', 'POSTED', 'CANCELLED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='水果盤點、腐壞、碰傷、試吃及其他庫存調整主檔';
 
 CREATE TABLE stock_adj_detail (
     stock_adj_detail_id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '庫存調整明細主鍵識別碼',
     stock_adj_id                   BIGINT UNSIGNED NOT NULL COMMENT '所屬庫存調整單主鍵',
-    line_no                        SMALLINT UNSIGNED NOT NULL COMMENT '庫存調整單行號',
+    item_no                        SMALLINT UNSIGNED NOT NULL COMMENT '庫存調整單行號',
     product_id                     BIGINT UNSIGNED NOT NULL COMMENT '調整商品',
-    inventory_ledger_id            BIGINT UNSIGNED NOT NULL COMMENT '實際調整的商品批號庫存帳',
-    quantity_change                DECIMAL(18,3) NOT NULL COMMENT '調整數量，增加為正數，耗損或盤虧為負數',
+    from_stock_lot_id              BIGINT UNSIGNED NULL COMMENT '調出或減少庫存的來源批號庫存帳；純入庫調整可為NULL',
+    to_stock_lot_id                BIGINT UNSIGNED NULL COMMENT '調入或增加庫存的目的批號庫存帳；純出庫調整可為NULL',
+    stock_in_qty                   DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '調入或增加的庫存數量',
+    stock_out_qty                  DECIMAL(18,3) NOT NULL DEFAULT 0 COMMENT '調出或減少的庫存數量',
     unit_cost                      DECIMAL(18,4) NULL COMMENT '本次調整使用的庫存單位成本',
     reason_code                    VARCHAR(30) NOT NULL COMMENT '原因代碼，例如SPOILAGE、SHRINKAGE、WEIGHING、DAMAGE、SAMPLE或COUNT_ERROR',
     remarks                       VARCHAR(500) NULL COMMENT '此明細補充說明',
     created_at                    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '資料建立時間',
     updated_at                    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '資料最後更新時間',
     PRIMARY KEY (stock_adj_detail_id),
-    UNIQUE KEY uk_stock_adj_detail_line (stock_adj_id, line_no),
-    KEY idx_stock_adj_detail_ledger (inventory_ledger_id),
+    UNIQUE KEY uk_stock_adj_detail_line (stock_adj_id, item_no),
+    KEY idx_stock_adj_detail_from_lot (from_stock_lot_id),
+    KEY idx_stock_adj_detail_to_lot (to_stock_lot_id),
     KEY idx_stock_adj_detail_product (product_id),
     CONSTRAINT fk_stock_adj_detail_header FOREIGN KEY (stock_adj_id) REFERENCES stock_adj (stock_adj_id) ON UPDATE RESTRICT ON DELETE CASCADE,
     CONSTRAINT fk_stock_adj_detail_product FOREIGN KEY (product_id) REFERENCES product (product_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT fk_adjustment_detail_ledger FOREIGN KEY (inventory_ledger_id) REFERENCES inventory_ledger (inventory_ledger_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT ck_adjustment_detail_qty CHECK (quantity_change <> 0),
-    CONSTRAINT ck_adjustment_detail_reason CHECK (reason_code IN ('SPOILAGE', 'SHRINKAGE', 'WEIGHING', 'DAMAGE', 'SAMPLE', 'COUNT_ERROR', 'OTHER'))
+    CONSTRAINT fk_stock_adj_detail_from_lot FOREIGN KEY (from_stock_lot_id) REFERENCES stock_lot (stock_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT fk_stock_adj_detail_to_lot FOREIGN KEY (to_stock_lot_id) REFERENCES stock_lot (stock_lot_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT ck_stock_adj_detail_qty CHECK ((stock_in_qty <> 0) OR (stock_out_qty <> 0)),
+    CONSTRAINT ck_stock_adj_detail_reason CHECK (reason_code IN ('SPOILAGE', 'SHRINKAGE', 'WEIGHING', 'DAMAGE', 'SAMPLE', 'COUNT_ERROR', 'OTHER'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='水果盤點、耗損與庫存調整明細';
 
 /* =========================================================
@@ -762,34 +884,69 @@ CREATE TABLE stock_adj_detail (
 
 CREATE OR REPLACE VIEW v_product_stock_balance AS
 SELECT
-    il.store_id AS store_id,
+    il.stock_ym AS stock_ym,il.store_id AS store_id,
     il.product_id AS product_id,
-    SUM(il.balance_qty) AS total_balance_qty,
-    SUM(CASE WHEN il.lot_type <> 'NEGATIVE' THEN il.balance_qty ELSE 0 END) AS normal_balance_qty,
-    SUM(CASE WHEN il.lot_type = 'NEGATIVE' THEN il.balance_qty ELSE 0 END) AS negative_balance_qty,
+    SUM(il.end_balance_qty) AS total_balance_qty,
+    SUM(CASE WHEN il.lot_type <> 'NEGATIVE' THEN il.end_balance_qty ELSE 0 END) AS normal_balance_qty,
+    SUM(CASE WHEN il.lot_type = 'NEGATIVE' THEN il.end_balance_qty ELSE 0 END) AS negative_balance_qty,
     SUM(il.balance_value) AS total_balance_value,
-    MIN(CASE WHEN il.lot_type = 'NORMAL' AND il.balance_qty > 0 THEN il.received_date ELSE NULL END) AS earliest_received_date,
-    MIN(CASE WHEN il.lot_type = 'NORMAL' AND il.balance_qty > 0 THEN il.expiry_date ELSE NULL END) AS earliest_expiry_date,
-    MAX(il.updated_at) AS last_inventory_updated_at
+    MIN(CASE WHEN il.lot_type = 'NORMAL' AND il.end_balance_qty > 0 THEN il.received_date ELSE NULL END) AS earliest_received_date,
+    MIN(CASE WHEN il.lot_type = 'NORMAL' AND il.end_balance_qty > 0 THEN il.expiry_date ELSE NULL END) AS earliest_expiry_date,
+    MAX(il.updated_at) AS last_stock_lot_updated_at
 FROM stock_lot il
-WHERE il.lot_status IN ('ACTIVE', 'DEPLETED', 'EXPIRED')
-GROUP BY il.store_id, il.product_id;
+WHERE il.lot_status = 'ACTIVE'
+GROUP BY il.stock_ym, il.store_id, il.product_id;
 
 CREATE OR REPLACE VIEW v_daily_product_sales AS
 SELECT
-    sh.store_id AS store_id,
-    sh.business_date AS business_date,
-    sd.product_id AS product_id,
-    SUM(CASE WHEN sh.sale_type = 'SALE' THEN sd.sale_qty ELSE -sd.sale_qty END) AS net_sale_qty,
-    SUM(CASE WHEN sh.sale_type = 'SALE' THEN sd.inventory_qty ELSE -sd.inventory_qty END) AS net_inventory_qty,
-    SUM(CASE WHEN sh.sale_type = 'SALE' THEN sd.line_amount ELSE -sd.line_amount END) AS net_sales_amount,
-    COUNT(DISTINCT sh.sales_id) AS transaction_count
+    sh.store_id,
+    sh.business_date,
+    sd.product_id,
+
+    SUM(
+        CASE
+            WHEN sh.sale_type = 'SALE'
+            THEN sd.sale_qty
+            ELSE -sd.sale_qty
+        END
+    ) AS net_sale_qty,
+
+    SUM(
+        CASE
+            WHEN sh.sale_type = 'SALE'
+            THEN sd.stock_qty
+            ELSE -sd.stock_qty
+        END
+    ) AS net_stock_qty,
+
+    SUM(
+        CASE
+            WHEN sh.sale_type = 'SALE'
+            THEN sd.amount
+            ELSE -sd.amount
+        END
+    ) AS net_sales_amount,
+
+    COUNT(DISTINCT sh.sales_master_id) AS transaction_count
+
 FROM sales_master sh
-JOIN sales_detail sd ON sd.sales_id = sh.sales_id
+JOIN sales_detail sd
+  ON sd.sales_master_id = sh.sales_master_id
+
 WHERE sh.sales_status IN ('COMPLETED', 'REFUNDED')
   AND sh.sale_type IN ('SALE', 'RETURN')
-GROUP BY sh.store_id, sh.business_date, sd.product_id;
 
+GROUP BY
+    sh.store_id,
+    sh.business_date,
+    sd.product_id;
+
+CREATE OR REPLACE VIEW v_latest_stock_lot AS
+SELECT
+    a.*
+FROM stock_lot a
+where a.lot_status IN ('ACTIVE');
+ 
 /* =========================================================
    12. 建議必要的初始資料範例（非必要，可自行調整後執行）
    ========================================================= */
