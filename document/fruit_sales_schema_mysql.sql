@@ -211,6 +211,7 @@ CREATE TABLE product (
     product_code                   VARCHAR(50) NOT NULL COMMENT '公司內部商品代碼，為主要業務唯一鍵',
     product_name                   VARCHAR(255) NOT NULL COMMENT 'POS與報表顯示的完整商品名稱',
     fruit_id                       BIGINT UNSIGNED NOT NULL COMMENT '對應水果基本資料',
+    image_path                     VARCHAR(500) NULL    COMMENT '商品主要圖片相對路徑、網址或物件儲存Key'
     origin_id                      BIGINT UNSIGNED NOT NULL COMMENT '商品標示產地，用於區分不同銷售商品',
     grade_id                       BIGINT UNSIGNED NULL COMMENT '商品等級，可為NULL表示不區分等級',
     size_id                        BIGINT UNSIGNED NULL COMMENT '商品大小規格，可為NULL表示不區分大小',
@@ -641,6 +642,7 @@ CREATE TABLE stock_lot_detail (
 -- @SCHEMA_REVIEW_IGNORE_BEGIN
 -- 原因：目前整合至 purchase_receipt_item 表
 --進貨過帳，控制進貨驗收單與庫存的過帳 
+/*
 CREATE TABLE purchase_posting (
     purchase_posting_id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '進貨過帳控制主鍵識別碼',
     purchase_receipt_item_id BIGINT UNSIGNED NOT NULL COMMENT '待過帳或已過帳的進貨驗收明細',
@@ -663,7 +665,7 @@ CREATE TABLE purchase_posting (
     CONSTRAINT ck_purchase_posting_status CHECK (posting_status IN ('PENDING', 'PROCESSING', 'POSTED', 'FAILED', 'CANCELLED')),
     CONSTRAINT ck_purchase_posting_qty CHECK (posted_stock_qty >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='進貨明細過帳控制，避免同一進貨重複增加庫存';
-
+*/
 /* =========================================================
    08. POS銷售與付款
    ========================================================= */
@@ -803,6 +805,7 @@ CREATE TABLE sales_posting_lot (
 -- @SCHEMA_REVIEW_IGNORE_BEGIN
 -- 原因：目前應該不用，期未再將負庫存調整為0庫存
 -- 定時任務將負庫存成本回填至原負庫存銷售,  
+/*
 CREATE TABLE negative_stock_settlement (
     negative_stock_settlement_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '負庫存成本回補主鍵識別碼',
     sales_posting_lot_id             BIGINT UNSIGNED NOT NULL COMMENT '原先使用NEGATIVE批號且成本待定的銷售沖銷明細',
@@ -820,7 +823,7 @@ CREATE TABLE negative_stock_settlement (
     CONSTRAINT ck_negative_settlement_qty CHECK (settled_qty > 0),
     CONSTRAINT ck_negative_settlement_cost CHECK (settlement_unit_cost >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='後續進貨先沖負庫存時，將實際成本回填至原負庫存銷售';
-
+*/
 /* =========================================================
    10. 損耗、盤點與庫存調整
    ========================================================= */
